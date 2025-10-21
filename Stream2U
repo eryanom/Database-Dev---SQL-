@@ -1,0 +1,314 @@
+
+/* =============================================================
+   Stream2U (Extended) — Solo Coursework Build Script
+   Target platform: Microsoft SQL Server (T‑SQL)
+   Scope per brief: core tables (tblFilm, tblStream, tblMember, tblMembershipType)
+   plus new entities: Account, Watch List, Actor (and FilmActor link for FeaturesIn).
+   ============================================================= */
+
+---------------------------------------------------------------
+-- 0) (Optional) Create + use a clean database
+---------------------------------------------------------------
+-- NOTE: Rename the database to match your submission if required.
+IF DB_ID(N'Stream2U_Extended') IS NULL
+BEGIN
+  EXEC ('CREATE DATABASE Stream2U_Extended');
+END;
+GO
+USE Stream2U_Extended;
+GO
+
+---------------------------------------------------------------
+-- 1) Drop objects if re-running (idempotent)
+---------------------------------------------------------------
+IF OBJECT_ID('dbo.tblFilmActor','U') IS NOT NULL DROP TABLE dbo.tblFilmActor;
+IF OBJECT_ID('dbo.tblActor','U') IS NOT NULL DROP TABLE dbo.tblActor;
+IF OBJECT_ID('dbo.tblWatchList','U') IS NOT NULL DROP TABLE dbo.tblWatchList;
+IF OBJECT_ID('dbo.tblAccount','U') IS NOT NULL DROP TABLE dbo.tblAccount;
+IF OBJECT_ID('dbo.tblStream','U') IS NOT NULL DROP TABLE dbo.tblStream;
+IF OBJECT_ID('dbo.tblFilm','U') IS NOT NULL DROP TABLE dbo.tblFilm;
+IF OBJECT_ID('dbo.tblMember','U') IS NOT NULL DROP TABLE dbo.tblMember;
+IF OBJECT_ID('dbo.tblMembershipType','U') IS NOT NULL DROP TABLE dbo.tblMembershipType;
+GO
+
+---------------------------------------------------------------
+-- 2) Core tables per specification
+---------------------------------------------------------------
+
+-- 2.1 Membership Types
+CREATE TABLE dbo.tblMembershipType
+(
+    mTypeID        TINYINT       NOT NULL CONSTRAINT PK_tblMembershipType PRIMARY KEY,
+    mTypeName      NVARCHAR(8)   NOT NULL,
+    minFilmsStream SMALLINT      NOT NULL,
+    mBenefit       NVARCHAR(100) NOT NULL,
+    CONSTRAINT CK_tblMembershipType_Name
+        CHECK (mTypeName IN (N'Bronze',N'Silver',N'Gold',N'Platinum'))
+);
+GO
+
+-- 2.2 Members
+CREATE TABLE dbo.tblMember
+(
+    memberID    INT           NOT NULL IDENTITY(1,1) CONSTRAINT PK_tblMember PRIMARY KEY,
+    firstName   NVARCHAR(30)  NOT NULL,
+    lastName    NVARCHAR(30)  NOT NULL,
+    dob         DATE          NOT NULL,
+    gender      NCHAR(1)      NULL     CONSTRAINT DF_tblMember_gender DEFAULT N'F',
+    dateJoined  DATE          NOT NULL CONSTRAINT DF_tblMember_dateJoined DEFAULT (CAST(GETDATE() AS DATE)),
+    fullName    AS (RTRIM(firstName) + N' ' + lastName) PERSISTED,
+    mTypeID     TINYINT       NOT NULL CONSTRAINT DF_tblMember_mTypeID DEFAULT (1),
+    CONSTRAINT FK_tblMember_tblMembershipType
+        FOREIGN KEY (mTypeID) REFERENCES dbo.tblMembershipType(mTypeID),
+    CONSTRAINT CK_tblMember_gender CHECK (gender IN (N'F', N'M', N'U')),
+    CONSTRAINT CK_tblMember_dob CHECK (dob >= '1900-01-01' AND dob < GETDATE())
+);
+GO
+
+-- 2.3 Films
+CREATE TABLE dbo.tblFilm
+(
+    filmID         INT           NOT NULL IDENTITY(101,1) CONSTRAINT PK_tblFilm PRIMARY KEY,
+    title          NVARCHAR(50)  NOT NULL,
+    genre          NVARCHAR(10)  NOT NULL,
+    classification NVARCHAR(3)   NOT NULL CONSTRAINT DF_tblFilm_class DEFAULT N'12A',
+    rentalCharge   MONEY         NOT NULL CONSTRAINT DF_tblFilm_rental DEFAULT 3.00,
+    CONSTRAINT CK_tblFilm_genre
+        CHECK (genre IN (N'Action', N'Children', N'Comedy', N'Drama', N'Horror', N'Romance', N'Sci-Fi')),
+    CONSTRAINT CK_tblFilm_class
+        CHECK (classification IN (N'U', N'PG', N'12A', N'15', N'18')),
+    CONSTRAINT CK_tblFilm_rental CHECK (rentalCharge BETWEEN 1.00 AND 10.00)
+);
+GO
+
+-- 2.4 Streams
+CREATE TABLE dbo.tblStream
+(
+    streamID       INT            NOT NULL IDENTITY(1001,1) CONSTRAINT PK_tblStream PRIMARY KEY,
+    memberID       INT            NOT NULL,
+    filmID         INT            NOT NULL,
+    memberRating   NUMERIC(3,1)   NULL     CONSTRAINT DF_tblStream_rating DEFAULT 5,
+    requestView    DATETIME       NOT NULL CONSTRAINT DF_tblStream_request DEFAULT (GETDATE()),
+    startView      DATETIME       NOT NULL,
+    requestToStart AS (DATEDIFF(SECOND, requestView, startView)) PERSISTED,
+    CONSTRAINT FK_tblStream_tblMember FOREIGN KEY (memberID) REFERENCES dbo.tblMember(memberID),
+    CONSTRAINT FK_tblStream_tblFilm   FOREIGN KEY (filmID)   REFERENCES dbo.tblFilm(filmID),
+    CONSTRAINT CK_tblStream_rating CHECK (memberRating IS NULL OR (memberRating >= 0.5 AND memberRating <= 10.0))
+);
+GO
+
+CREATE INDEX IX_tblStream_member ON dbo.tblStream(memberID);
+CREATE INDEX IX_tblStream_film   ON dbo.tblStream(filmID);
+GO
+
+---------------------------------------------------------------
+-- 3) New entities for the Extended ERD
+---------------------------------------------------------------
+
+-- 3.1 Account (1:1 with Member; Member has exactly one Account)
+CREATE TABLE dbo.tblAccount
+(
+    accountID     INT            NOT NULL IDENTITY(1,1) CONSTRAINT PK_tblAccount PRIMARY KEY,
+    memberID      INT            NOT NULL UNIQUE, -- enforce 1:1
+    createDate    DATETIME       NOT NULL CONSTRAINT DF_tblAccount_create DEFAULT (GETDATE()),
+    eMail         NVARCHAR(255)  NOT NULL,
+    passwordHash  VARBINARY(64)  NOT NULL,
+    passwordSalt  VARBINARY(32)  NOT NULL,
+    CONSTRAINT FK_tblAccount_tblMember FOREIGN KEY (memberID) REFERENCES dbo.tblMember(memberID),
+    CONSTRAINT UQ_tblAccount_email UNIQUE (eMail),
+    -- very simple format check; adequate for coursework (not production‑grade)
+    CONSTRAINT CK_tblAccount_email CHECK (eMail LIKE N'%_@_%._%')
+);
+GO
+
+-- 3.2 Watch List (Member adds Films; unique active entry per film)
+CREATE TABLE dbo.tblWatchList
+(
+    watchItemID  INT   NOT NULL IDENTITY(1,1) CONSTRAINT PK_tblWatchList PRIMARY KEY,
+    memberID     INT   NOT NULL,
+    filmID       INT   NOT NULL,
+    dateAdded    DATE  NOT NULL CONSTRAINT DF_tblWatchList_added DEFAULT (CAST(GETDATE() AS DATE)),
+    dateRemoved  DATE  NULL,
+    CONSTRAINT FK_tblWatchList_tblMember FOREIGN KEY (memberID) REFERENCES dbo.tblMember(memberID),
+    CONSTRAINT FK_tblWatchList_tblFilm   FOREIGN KEY (filmID)   REFERENCES dbo.tblFilm(filmID),
+    CONSTRAINT CK_tblWatchList_dates CHECK (dateRemoved IS NULL OR dateRemoved >= dateAdded)
+);
+GO
+
+-- Unique active watch‑list item per (member, film)
+CREATE UNIQUE INDEX IX_tblWatchList_MemberFilm_Active
+ON dbo.tblWatchList(memberID, filmID)
+WHERE dateRemoved IS NULL;
+GO
+
+-- 3.3 Actor + FeaturesIn (FilmActor link with 'role')
+CREATE TABLE dbo.tblActor
+(
+    actorID      INT           NOT NULL IDENTITY(1,1) CONSTRAINT PK_tblActor PRIMARY KEY,
+    name         NVARCHAR(100) NOT NULL,
+    gender       NCHAR(1)      NULL,
+    nationality  NVARCHAR(60)  NULL,
+    twitterName  NVARCHAR(30)  NULL,
+    CONSTRAINT CK_tblActor_gender CHECK (gender IN (N'F', N'M', N'U') OR gender IS NULL),
+    CONSTRAINT UQ_tblActor_twitter UNIQUE (twitterName)
+);
+GO
+
+CREATE TABLE dbo.tblFilmActor
+(
+    filmID  INT NOT NULL,
+    actorID INT NOT NULL,
+    role    NVARCHAR(60) NULL,
+    CONSTRAINT PK_tblFilmActor PRIMARY KEY (filmID, actorID),
+    CONSTRAINT FK_tblFilmActor_tblFilm  FOREIGN KEY (filmID)  REFERENCES dbo.tblFilm(filmID),
+    CONSTRAINT FK_tblFilmActor_tblActor FOREIGN KEY (actorID) REFERENCES dbo.tblActor(actorID)
+);
+GO
+
+---------------------------------------------------------------
+-- 4) Seed data (small but non‑trivial set)
+---------------------------------------------------------------
+
+-- 4.1 Membership types
+INSERT INTO dbo.tblMembershipType(mTypeID, mTypeName, minFilmsStream, mBenefit) VALUES
+ (1,N'Bronze',  0,  N'0% bonus credit'),
+ (2,N'Silver',  5,  N'5% bonus credit'),
+ (3,N'Gold',    12, N'10% bonus credit'),
+ (4,N'Platinum',20, N'15% bonus credit');
+
+-- 4.2 Members
+INSERT INTO dbo.tblMember(firstName,lastName,dob,gender,dateJoined,mTypeID) VALUES
+ (N'Ava',   N'Carswell','1997-03-14','F',DEFAULT,2),
+ (N'Liam',  N'Nguyen',  '1993-11-02','M',DEFAULT,3),
+ (N'Noah',  N'O''Brien','2001-07-21','M',DEFAULT,1),
+ (N'Isla',  N'Singh',   '1999-01-09','F',DEFAULT,4);
+
+-- 4.3 Accounts (dummy hashes/salts for coursework only)
+INSERT INTO dbo.tblAccount(memberID, eMail, passwordHash, passwordSalt) VALUES
+ (1, N'ava@example.com',   0x01, 0xAA),
+ (2, N'liam@example.com',  0x02, 0xBB),
+ (3, N'noah@example.com',  0x03, 0xCC),
+ (4, N'isla@example.com',  0x04, 0xDD);
+
+-- 4.4 Films
+INSERT INTO dbo.tblFilm(title,genre,classification,rentalCharge) VALUES
+ (N'The Nebula Chase',    N'Action',  N'12A', 3.99),
+ (N'Giggles & Gravy',     N'Comedy',  N'PG',  2.50),
+ (N'Haunted By Noon',     N'Horror',  N'15',  4.25),
+ (N'Love at Platform 9',  N'Romance', N'12A', 2.99),
+ (N'Kids Save Planet',    N'Children',N'U',   1.50),
+ (N'Mathletes',           N'Drama',   N'12A', 3.00);
+
+-- 4.5 Actors
+INSERT INTO dbo.tblActor(name, gender, nationality, twitterName) VALUES
+ (N'Maya Patel','F',N'UK',  N'@mayap'),
+ (N'Jon Park',  'M',N'USA', N'@jonpark'),
+ (N'Sam Lee',   'U',N'Canada', NULL);
+
+-- 4.6 FeaturesIn
+INSERT INTO dbo.tblFilmActor(filmID,actorID,role) VALUES
+ (101,1,N'Commander Hale'),
+ (101,2,N'Rogue Pilot'),
+ (104,1,N'Commuter #1'),
+ (103,3,N'Caretaker');
+
+-- 4.7 Watch List
+INSERT INTO dbo.tblWatchList(memberID,filmID,dateAdded) VALUES
+ (1,101,DEFAULT),
+ (1,104,DEFAULT),
+ (2,103,DEFAULT),
+ (3,105,DEFAULT),
+ (4,101,DEFAULT);
+
+-- 4.8 Streams
+DECLARE @now DATETIME = DATEADD(HOUR,-2,GETDATE());
+INSERT INTO dbo.tblStream(memberID,filmID,memberRating,requestView,startView) VALUES
+ (1,101,8.5, DATEADD(MINUTE,-90,@now), DATEADD(MINUTE,-80,@now)),
+ (2,103,6.0, DATEADD(MINUTE,-70,@now), DATEADD(MINUTE,-60,@now)),
+ (1,104,7.0, DATEADD(MINUTE,-50,@now), DATEADD(MINUTE,-48,@now)),
+ (3,105,NULL,DATEADD(MINUTE,-40,@now), DATEADD(MINUTE,-35,@now)),
+ (4,101,9.0, DATEADD(MINUTE,-30,@now), DATEADD(MINUTE,-25,@now));
+
+---------------------------------------------------------------
+-- 5) Example queries for Section 6
+---------------------------------------------------------------
+
+-- Q1: All films (for browsing)
+SELECT * FROM dbo.tblFilm ORDER BY title;
+
+-- Q2: Members with membership type
+SELECT m.memberID, m.fullName, mt.mTypeName, mt.mBenefit
+FROM dbo.tblMember m
+JOIN dbo.tblMembershipType mt ON m.mTypeID = mt.mTypeID
+ORDER BY m.memberID;
+
+-- Q3: Streams summary and revenue by film
+SELECT f.title,
+       COUNT(*)           AS totalStreams,
+       SUM(f.rentalCharge) AS revenueNominal
+FROM dbo.tblStream s
+JOIN dbo.tblFilm f ON s.filmID = f.filmID
+GROUP BY f.title
+ORDER BY totalStreams DESC;
+
+-- Q4: Top films by average rating (min 2 ratings)
+SELECT TOP (5) f.title,
+       AVG(CAST(s.memberRating AS FLOAT)) AS avgRating,
+       COUNT(s.memberRating) AS ratings
+FROM dbo.tblStream s
+JOIN dbo.tblFilm f ON f.filmID = s.filmID
+WHERE s.memberRating IS NOT NULL
+GROUP BY f.title
+HAVING COUNT(s.memberRating) >= 2
+ORDER BY avgRating DESC;
+
+-- Q5: Active watch‑list items for a member (by email)
+DECLARE @email NVARCHAR(255) = N'ava@example.com';
+SELECT wl.watchItemID, f.title, wl.dateAdded
+FROM dbo.tblWatchList wl
+JOIN dbo.tblFilm f   ON f.filmID = wl.filmID
+JOIN dbo.tblAccount a ON a.memberID = wl.memberID
+WHERE a.eMail = @email
+  AND wl.dateRemoved IS NULL
+ORDER BY wl.dateAdded DESC;
+
+-- Q6: Members with no streams in the last 30 days
+SELECT m.memberID, m.fullName
+FROM dbo.tblMember m
+WHERE NOT EXISTS
+(
+    SELECT 1 FROM dbo.tblStream s
+    WHERE s.memberID = m.memberID
+      AND s.requestView >= DATEADD(DAY,-30,GETDATE())
+);
+
+-- Q7: Actors in a given film
+DECLARE @film NVARCHAR(50) = N'The Nebula Chase';
+SELECT a.name, fa.role
+FROM dbo.tblFilmActor fa
+JOIN dbo.tblFilm f ON f.filmID = fa.filmID
+JOIN dbo.tblActor a ON a.actorID = fa.actorID
+WHERE f.title = @film;
+
+-- Q8: Average request‑to‑start time per member (seconds)
+SELECT m.fullName, AVG(s.requestToStart) AS avgSeconds
+FROM dbo.tblStream s
+JOIN dbo.tblMember m ON m.memberID = s.memberID
+GROUP BY m.fullName
+ORDER BY avgSeconds DESC;
+
+-- Q9: Films not on any active watch list
+SELECT f.filmID, f.title
+FROM dbo.tblFilm f
+WHERE NOT EXISTS
+(
+    SELECT 1 FROM dbo.tblWatchList wl
+    WHERE wl.filmID = f.filmID AND wl.dateRemoved IS NULL
+);
+
+-- Q10: Membership distribution
+SELECT mt.mTypeName, COUNT(*) AS members
+FROM dbo.tblMember m
+JOIN dbo.tblMembershipType mt ON mt.mTypeID = m.mTypeID
+GROUP BY mt.mTypeName
+ORDER BY members DESC;
